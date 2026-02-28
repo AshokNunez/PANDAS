@@ -7,10 +7,6 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# -------------------------------------------------
-# 🔑 Dynamic Column Configuration
-# -------------------------------------------------
-
 PEOPLE_TABLE = "people"
 BUSINESS_TABLE = "business"
 COMPANY_TABLE = "company"
@@ -20,54 +16,62 @@ BUSINESS_BUSINESS_CODE_COL = "business_code"
 
 PEOPLE_CODE_SERVICE_COL = "code_service"
 COMPANY_CODE_SERVICE_COL = "code_service"
+
 COMPANY_UID_COL = "uid"
 BUSINESS_UID_COL = "uid"
 
-BUSINESS_PREFIX = "business_"   # naming convention
+BUSINESS_PREFIX = "business_"
 
 try:
     con = duckdb.connect("referential_pipeline.duckdb")
     logging.info("Pipeline started")
 
     # -------------------------------------------------
-    # 1️⃣ Normalize Keys (Trim + Lower)
+    # 1️⃣ Strict Deduplicate Business (1 row per key)
     # -------------------------------------------------
 
     con.execute(f"""
-        CREATE OR REPLACE TABLE people_clean AS
-        SELECT *,
-               NULLIF(LOWER(TRIM({PEOPLE_BUSINESS_CODE_COL})), '') AS clean_business_code,
-               NULLIF(LOWER(TRIM({PEOPLE_CODE_SERVICE_COL})), '') AS clean_code_service
-        FROM {PEOPLE_TABLE};
+        CREATE OR REPLACE TABLE business_dedup AS
+        SELECT *
+        FROM (
+            SELECT *,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY {BUSINESS_BUSINESS_CODE_COL}
+                       ORDER BY {BUSINESS_UID_COL}
+                   ) AS rn
+            FROM {BUSINESS_TABLE}
+        )
+        WHERE rn = 1;
     """)
-
-    con.execute(f"""
-        CREATE OR REPLACE TABLE business_clean AS
-        SELECT *,
-               NULLIF(LOWER(TRIM({BUSINESS_BUSINESS_CODE_COL})), '') AS clean_business_code,
-               NULLIF(LOWER(TRIM({BUSINESS_UID_COL})), '') AS clean_uid
-        FROM {BUSINESS_TABLE};
-    """)
-
-    con.execute(f"""
-        CREATE OR REPLACE TABLE company_clean AS
-        SELECT *,
-               NULLIF(LOWER(TRIM({COMPANY_CODE_SERVICE_COL})), '') AS clean_code_service,
-               NULLIF(LOWER(TRIM({COMPANY_UID_COL})), '') AS clean_uid
-        FROM {COMPANY_TABLE};
-    """)
-
-    logging.info("Key normalization completed")
 
     # -------------------------------------------------
-    # 2️⃣ Get Business Columns Dynamically
+    # 2️⃣ Strict Deduplicate Company
+    # -------------------------------------------------
+
+    con.execute(f"""
+        CREATE OR REPLACE TABLE company_dedup AS
+        SELECT *
+        FROM (
+            SELECT *,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY {COMPANY_CODE_SERVICE_COL}
+                       ORDER BY {COMPANY_UID_COL}
+                   ) AS rn
+            FROM {COMPANY_TABLE}
+        )
+        WHERE rn = 1;
+    """)
+
+    logging.info("Deduplication complete")
+
+    # -------------------------------------------------
+    # 3️⃣ Dynamic Business Columns
     # -------------------------------------------------
 
     business_columns = con.execute(f"""
         SELECT column_name
         FROM information_schema.columns
         WHERE table_name = '{BUSINESS_TABLE}'
-        AND column_name NOT IN ('clean_business_code','clean_uid')
     """).fetchall()
 
     business_select_clause = ",\n".join([
@@ -76,62 +80,44 @@ try:
     ])
 
     # -------------------------------------------------
-    # 3️⃣ Direct Match
+    # 4️⃣ Deterministic Single Join (No Row Multiplication)
     # -------------------------------------------------
 
     con.execute(f"""
-        CREATE OR REPLACE TABLE direct_match AS
-        SELECT
-            p.*,
-            {business_select_clause},
-            'DIRECT_BUSINESS_CODE' AS match_type
-        FROM people_clean p
-        LEFT JOIN business_clean b
-            ON p.clean_business_code = b.clean_business_code;
-    """)
-
-    logging.info("Direct matching completed")
-
-    # -------------------------------------------------
-    # 4️⃣ Fallback Only for Non-Matched
-    # -------------------------------------------------
-
-    con.execute("""
-        CREATE OR REPLACE TABLE no_direct AS
-        SELECT p.*
-        FROM people_clean p
-        LEFT JOIN business_clean b
-            ON p.clean_business_code = b.clean_business_code
-        WHERE b.clean_business_code IS NULL;
-    """)
-
-    con.execute(f"""
-        CREATE OR REPLACE TABLE fallback_match AS
-        SELECT
-            p.*,
-            {business_select_clause},
-            'FALLBACK_CODE_SERVICE' AS match_type
-        FROM no_direct p
-        LEFT JOIN company_clean c
-            ON p.clean_code_service = c.clean_code_service
-        LEFT JOIN business_clean b
-            ON c.clean_uid = b.clean_uid;
-    """)
-
-    logging.info("Fallback matching completed")
-
-    # -------------------------------------------------
-    # 5️⃣ Combine
-    # -------------------------------------------------
-
-    con.execute("""
         CREATE OR REPLACE TABLE final_output AS
-        SELECT * FROM direct_match
-        UNION ALL
-        SELECT * FROM fallback_match;
+        SELECT
+            p.*,
+            {business_select_clause},
+            CASE
+                WHEN b.{BUSINESS_BUSINESS_CODE_COL} IS NOT NULL THEN 'DIRECT'
+                WHEN bf.{BUSINESS_BUSINESS_CODE_COL} IS NOT NULL THEN 'FALLBACK'
+                ELSE 'NO_MATCH'
+            END AS match_type
+        FROM {PEOPLE_TABLE} p
+
+        -- Direct match
+        LEFT JOIN business_dedup b
+            ON p.{PEOPLE_BUSINESS_CODE_COL} = b.{BUSINESS_BUSINESS_CODE_COL}
+
+        -- Fallback via company -> business
+        LEFT JOIN company_dedup c
+            ON p.{PEOPLE_CODE_SERVICE_COL} = c.{COMPANY_CODE_SERVICE_COL}
+
+        LEFT JOIN business_dedup bf
+            ON c.{COMPANY_UID_COL} = bf.{BUSINESS_UID_COL};
     """)
 
-    logging.info("Final table created")
+    logging.info("Final table created without row multiplication")
+
+    # -------------------------------------------------
+    # 5️⃣ Optional: Remove Ambiguous Cases
+    # -------------------------------------------------
+    # If both direct and fallback exist → keep direct only
+    con.execute("""
+        DELETE FROM final_output
+        WHERE match_type = 'FALLBACK'
+        AND business_business_code IS NOT NULL;
+    """)
 
     # -------------------------------------------------
     # 6️⃣ Export
@@ -146,4 +132,3 @@ try:
 except Exception as e:
     logging.error(str(e))
     raise
-How its reading parquet files
