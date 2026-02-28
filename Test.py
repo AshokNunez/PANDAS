@@ -1,12 +1,23 @@
 from pathlib import Path
 import pandas as pd
 import logging
+import numpy as np
 
 # -------------------------------
 # Configuration
 # -------------------------------
-folder = Path("your_folder_path_here")
-log_file = folder / "conversion.log"
+input_folder = Path("your_input_folder_here")
+output_folder = Path("your_output_folder_here")
+output_folder.mkdir(parents=True, exist_ok=True)
+
+log_file = output_folder / "string_conversion.log"
+
+# Columns to convert to string
+COLUMNS_TO_CONVERT = [
+    "business_code",
+    "uid",
+    "company"
+]
 
 # -------------------------------
 # Logging Setup
@@ -17,55 +28,75 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-logging.info("=== Conversion Started ===")
-
-# -------------------------------
-# Function to handle missing values
-# -------------------------------
-def handle_missing_values(df: pd.DataFrame) -> pd.DataFrame:
-    
-    # Fill numeric columns with 0
-    numeric_cols = df.select_dtypes(include=["number"]).columns
-    df[numeric_cols] = df[numeric_cols].fillna(0)
-
-    # Fill string/object columns with 'Unknown'
-    object_cols = df.select_dtypes(include=["object"]).columns
-    df[object_cols] = df[object_cols].fillna("Unknown")
-
-    return df
+logging.info("=== Vectorized String Conversion Started ===")
 
 
 # -------------------------------
-# File Processing
+# Vectorized Conversion Function
 # -------------------------------
-for file in folder.iterdir():
+def convert_column_vectorized(series: pd.Series) -> pd.Series:
+    """
+    Vectorized conversion:
+    - Converts to string
+    - Removes trailing .0
+    - Strips spaces
+    - Preserves NaN
+    """
+    # Preserve null mask
+    null_mask = series.isna()
 
-    if file.suffix.lower() in [".xlsx", ".csv"]:
+    # Convert to string
+    series = series.astype(str)
 
-        try:
-            logging.info(f"Processing file: {file.name}")
-            print(f"Processing {file.name}")
+    # Remove trailing .0 (for floats converted to string)
+    series = series.str.replace(r"\.0$", "", regex=True)
 
-            # Read file
-            if file.suffix.lower() == ".xlsx":
-                df = pd.read_excel(file)
-            else:
-                df = pd.read_csv(file)
+    # Strip spaces
+    series = series.str.strip()
 
-            # Log missing values before handling
-            missing_count = df.isna().sum().sum()
-            logging.info(f"Missing values found: {missing_count}")
+    # Restore NaN
+    series[null_mask] = np.nan
 
-            # Handle missing values
-            df = handle_missing_values(df)
+    return series
 
-            # Convert to parquet
-            parquet_path = file.with_suffix(".parquet")
-            df.to_parquet(parquet_path, index=False)
 
-            logging.info(f"Successfully converted: {parquet_path.name}")
+# -------------------------------
+# Process Files
+# -------------------------------
+for file in input_folder.iterdir():
 
-        except Exception as e:
-            logging.error(f"Error processing {file.name} - {str(e)}")
+    if file.suffix.lower() not in [".xlsx", ".csv"]:
+        continue
 
-logging.info("=== Conversion Completed ===")
+    try:
+        logging.info(f"Processing file: {file.name}")
+        print(f"Processing {file.name}")
+
+        # Read file
+        if file.suffix.lower() == ".xlsx":
+            df = pd.read_excel(file)
+        else:
+            df = pd.read_csv(file)
+
+        # Convert only existing columns
+        existing_cols = [c for c in COLUMNS_TO_CONVERT if c in df.columns]
+        missing_cols = list(set(COLUMNS_TO_CONVERT) - set(existing_cols))
+
+        if missing_cols:
+            logging.warning(f"Missing columns skipped: {missing_cols}")
+
+        for col in existing_cols:
+            df[col] = convert_column_vectorized(df[col])
+            logging.info(f"Converted column: {col}")
+
+        # Save as parquet in output folder
+        output_file = output_folder / f"{file.stem}.parquet"
+        df.to_parquet(output_file, index=False)
+
+        logging.info(f"Saved parquet: {output_file.name}")
+
+    except Exception as e:
+        logging.error(f"Error processing {file.name} - {str(e)}")
+
+logging.info("=== Processing Completed Successfully ===")
+print("Vectorized string conversion completed.")
