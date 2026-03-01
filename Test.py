@@ -7,18 +7,29 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
+# =========================================================
+# TABLE NAMES
+# =========================================================
 PEOPLE_TABLE = "people"
 BUSINESS_TABLE = "business"
 COMPANY_TABLE = "company"
 
-PEOPLE_BUSINESS_CODE_COL = "business_code"
-BUSINESS_BUSINESS_CODE_COL = "business_code"
-
+# =========================================================
+# COLUMN CONFIGURATION
+# =========================================================
+PEOPLE_EIR_COL = "eir_code"
+PEOPLE_POLE_COL = "pole"
+PEOPLE_SOUS_POLE_COL = "sous_pole"
+PEOPLE_DEPT_COL = "department"
 PEOPLE_CODE_SERVICE_COL = "code_service"
-COMPANY_CODE_SERVICE_COL = "code_service"
 
-COMPANY_UID_COL = "uid"
+BUSINESS_EIR_COL = "business_code"
+BUSINESS_POLE_COL = "pole"
+BUSINESS_SOUS_POLE_COL = "sous_pole"
 BUSINESS_UID_COL = "uid"
+
+COMPANY_CODE_SERVICE_COL = "code_service"
+COMPANY_UID_COL = "uid"
 
 BUSINESS_PREFIX = "business_"
 
@@ -26,28 +37,26 @@ try:
     con = duckdb.connect("referential_pipeline.duckdb")
     logging.info("Pipeline started")
 
-    # -------------------------------------------------
-    # 1️⃣ Strict Deduplicate Business (1 row per key)
-    # -------------------------------------------------
-
+    # =========================================================
+    # 1️⃣ Deduplicate Business
+    # =========================================================
     con.execute(f"""
         CREATE OR REPLACE TABLE business_dedup AS
         SELECT *
         FROM (
             SELECT *,
                    ROW_NUMBER() OVER (
-                       PARTITION BY {BUSINESS_BUSINESS_CODE_COL}
+                       PARTITION BY {BUSINESS_EIR_COL}
                        ORDER BY {BUSINESS_UID_COL}
-                   ) AS rn
+                   ) rn
             FROM {BUSINESS_TABLE}
         )
         WHERE rn = 1;
     """)
 
-    # -------------------------------------------------
-    # 2️⃣ Strict Deduplicate Company
-    # -------------------------------------------------
-
+    # =========================================================
+    # 2️⃣ Deduplicate Company
+    # =========================================================
     con.execute(f"""
         CREATE OR REPLACE TABLE company_dedup AS
         SELECT *
@@ -56,7 +65,7 @@ try:
                    ROW_NUMBER() OVER (
                        PARTITION BY {COMPANY_CODE_SERVICE_COL}
                        ORDER BY {COMPANY_UID_COL}
-                   ) AS rn
+                   ) rn
             FROM {COMPANY_TABLE}
         )
         WHERE rn = 1;
@@ -64,14 +73,13 @@ try:
 
     logging.info("Deduplication complete")
 
-    # -------------------------------------------------
+    # =========================================================
     # 3️⃣ Dynamic Business Columns
-    # -------------------------------------------------
-
+    # =========================================================
     business_columns = con.execute(f"""
         SELECT column_name
         FROM information_schema.columns
-        WHERE table_name = '{BUSINESS_TABLE}'
+        WHERE table_name = 'business_dedup'
     """).fetchall()
 
     business_select_clause = ",\n".join([
@@ -79,27 +87,78 @@ try:
         for col in business_columns
     ])
 
-    # -------------------------------------------------
-    # 4️⃣ Deterministic Single Join (No Row Multiplication)
-    # -------------------------------------------------
-
+    # =========================================================
+    # 4️⃣ PRIORITY MATCHING + RANKING + CONFIDENCE
+    # =========================================================
     con.execute(f"""
         CREATE OR REPLACE TABLE final_output AS
         SELECT
             p.*,
             {business_select_clause},
+
+            -- Match Type
             CASE
-                WHEN b.{BUSINESS_BUSINESS_CODE_COL} IS NOT NULL THEN 'DIRECT'
-                WHEN bf.{BUSINESS_BUSINESS_CODE_COL} IS NOT NULL THEN 'FALLBACK'
+                WHEN LOWER(p.{PEOPLE_DEPT_COL}) LIKE '%gts%'
+                     AND p.{PEOPLE_POLE_COL} = b.{BUSINESS_POLE_COL}
+                     AND p.{PEOPLE_EIR_COL} = b.{BUSINESS_EIR_COL}
+                THEN 'STEP1_GTS_MATCH'
+
+                WHEN LOWER(p.{PEOPLE_DEPT_COL}) NOT LIKE '%gts%'
+                     AND p.{PEOPLE_POLE_COL} = b.{BUSINESS_POLE_COL}
+                     AND p.{PEOPLE_SOUS_POLE_COL} = b.{BUSINESS_SOUS_POLE_COL}
+                     AND p.{PEOPLE_EIR_COL} = b.{BUSINESS_EIR_COL}
+                THEN 'STEP2_SOUS_POLE_MATCH'
+
+                WHEN p.{PEOPLE_EIR_COL} = b.{BUSINESS_EIR_COL}
+                THEN 'STEP3_DIRECT_MATCH'
+
+                WHEN bf.{BUSINESS_EIR_COL} IS NOT NULL
+                THEN 'STEP4_COMPANY_FALLBACK'
+
                 ELSE 'NO_MATCH'
-            END AS match_type
+            END AS match_type,
+
+            -- Match Rank (lower is better)
+            CASE
+                WHEN LOWER(p.{PEOPLE_DEPT_COL}) LIKE '%gts%'
+                     AND p.{PEOPLE_POLE_COL} = b.{BUSINESS_POLE_COL}
+                     AND p.{PEOPLE_EIR_COL} = b.{BUSINESS_EIR_COL}
+                THEN 1
+
+                WHEN LOWER(p.{PEOPLE_DEPT_COL}) NOT LIKE '%gts%'
+                     AND p.{PEOPLE_POLE_COL} = b.{BUSINESS_POLE_COL}
+                     AND p.{PEOPLE_SOUS_POLE_COL} = b.{BUSINESS_SOUS_POLE_COL}
+                     AND p.{PEOPLE_EIR_COL} = b.{BUSINESS_EIR_COL}
+                THEN 2
+
+                WHEN p.{PEOPLE_EIR_COL} = b.{BUSINESS_EIR_COL}
+                THEN 3
+
+                WHEN bf.{BUSINESS_EIR_COL} IS NOT NULL
+                THEN 4
+
+                ELSE 99
+            END AS match_rank,
+
+            -- Confidence Score
+            CASE
+                WHEN LOWER(p.{PEOPLE_DEPT_COL}) LIKE '%gts%' THEN 100
+                WHEN p.{PEOPLE_SOUS_POLE_COL} IS NOT NULL THEN 90
+                WHEN p.{PEOPLE_EIR_COL} IS NOT NULL THEN 75
+                WHEN bf.{BUSINESS_EIR_COL} IS NOT NULL THEN 60
+                ELSE 0
+            END AS confidence_score,
+
+            -- Audit Flags
+            (LOWER(p.{PEOPLE_DEPT_COL}) LIKE '%gts%') AS is_gts_department,
+            (p.{PEOPLE_POLE_COL} IS NOT NULL) AS has_pole,
+            (p.{PEOPLE_SOUS_POLE_COL} IS NOT NULL) AS has_sous_pole
+
         FROM {PEOPLE_TABLE} p
 
-        -- Direct match
         LEFT JOIN business_dedup b
-            ON p.{PEOPLE_BUSINESS_CODE_COL} = b.{BUSINESS_BUSINESS_CODE_COL}
+            ON p.{PEOPLE_EIR_COL} = b.{BUSINESS_EIR_COL}
 
-        -- Fallback via company -> business
         LEFT JOIN company_dedup c
             ON p.{PEOPLE_CODE_SERVICE_COL} = c.{COMPANY_CODE_SERVICE_COL}
 
@@ -107,24 +166,27 @@ try:
             ON c.{COMPANY_UID_COL} = bf.{BUSINESS_UID_COL};
     """)
 
-    logging.info("Final table created without row multiplication")
+    logging.info("Priority matching completed")
 
-    # -------------------------------------------------
-    # 5️⃣ Optional: Remove Ambiguous Cases
-    # -------------------------------------------------
-    # If both direct and fallback exist → keep direct only
+    # =========================================================
+    # 5️⃣ Metrics Logging
+    # =========================================================
+    total = con.execute("SELECT COUNT(*) FROM final_output").fetchone()[0]
+    unmatched = con.execute("""
+        SELECT COUNT(*) FROM final_output
+        WHERE match_type = 'NO_MATCH'
+    """).fetchone()[0]
+
+    logging.info(f"Total rows processed: {total}")
+    logging.info(f"Unmatched rows: {unmatched}")
+
+    # =========================================================
+    # 6️⃣ Export Optimized Parquet
+    # =========================================================
     con.execute("""
-        DELETE FROM final_output
-        WHERE match_type = 'FALLBACK'
-        AND business_business_code IS NOT NULL;
-    """)
-
-    # -------------------------------------------------
-    # 6️⃣ Export
-    # -------------------------------------------------
-
-    con.execute("""
-        COPY final_output TO 'final_output.parquet' (FORMAT PARQUET);
+        COPY final_output
+        TO 'final_output.parquet'
+        (FORMAT PARQUET, COMPRESSION ZSTD);
     """)
 
     logging.info("Export completed successfully")
