@@ -1,196 +1,166 @@
 import duckdb
-import logging
 
-logging.basicConfig(
-    filename="referential_pipeline.log",
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+# ==========================
+# CONFIGURATION VARIABLES
+# ==========================
 
-# =========================================================
-# TABLE NAMES
-# =========================================================
-PEOPLE_TABLE = "people"
-BUSINESS_TABLE = "business"
-COMPANY_TABLE = "company"
+PEOPLE_PARQUET = "parquet_folder/people_*.parquet"
+BUSINESS_PARQUET = "parquet_folder/business_*.parquet"
+OUTPUT_PARQUET = "output_folder/people_referential.parquet"
 
-# =========================================================
-# COLUMN CONFIGURATION
-# =========================================================
-PEOPLE_EIR_COL = "eir_code"
-PEOPLE_POLE_COL = "pole"
-PEOPLE_SOUS_POLE_COL = "sous_pole"
-PEOPLE_DEPT_COL = "department"
-PEOPLE_CODE_SERVICE_COL = "code_service"
+# Column Names (Change if needed)
+PEOPLE_UID = "uid"
+PEOPLE_BUSINESS_CODE = "business_code"
+PEOPLE_EIR = "eir_code"
+PEOPLE_POLE = "pole"
+PEOPLE_SOUS_POLE = "sous_pole"
+PEOPLE_DEPARTMENT = "department"
 
-BUSINESS_EIR_COL = "business_code"
-BUSINESS_POLE_COL = "pole"
-BUSINESS_SOUS_POLE_COL = "sous_pole"
-BUSINESS_UID_COL = "uid"
+BUSINESS_CODE = "business_code"
+BUSINESS_EIR = "eir_code"
+BUSINESS_POLE = "pole"
+BUSINESS_SOUS_POLE = "sous_pole"
+BUSINESS_DEPARTMENT = "department"
 
-COMPANY_CODE_SERVICE_COL = "code_service"
-COMPANY_UID_COL = "uid"
+# ==========================
+# CONNECT
+# ==========================
 
-BUSINESS_PREFIX = "business_"
+con = duckdb.connect()
 
-try:
-    con = duckdb.connect("referential_pipeline.duckdb")
-    logging.info("Pipeline started")
+# ==========================
+# CREATE BASE TABLES
+# ==========================
 
-    # =========================================================
-    # 1️⃣ Deduplicate Business
-    # =========================================================
-    con.execute(f"""
-        CREATE OR REPLACE TABLE business_dedup AS
-        SELECT *
-        FROM (
-            SELECT *,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY {BUSINESS_EIR_COL}
-                       ORDER BY {BUSINESS_UID_COL}
-                   ) rn
-            FROM {BUSINESS_TABLE}
-        )
-        WHERE rn = 1;
-    """)
+con.execute(f"""
+CREATE OR REPLACE TABLE people AS
+SELECT 
+    *,
+    TRIM(UPPER(CAST({PEOPLE_BUSINESS_CODE} AS VARCHAR))) AS business_code_clean,
+    TRIM(UPPER(CAST({PEOPLE_EIR} AS VARCHAR))) AS eir_clean,
+    TRIM(UPPER(CAST({PEOPLE_POLE} AS VARCHAR))) AS pole_clean,
+    TRIM(UPPER(CAST({PEOPLE_SOUS_POLE} AS VARCHAR))) AS sous_pole_clean,
+    TRIM(UPPER(CAST({PEOPLE_DEPARTMENT} AS VARCHAR))) AS dept_clean
+FROM read_parquet('{PEOPLE_PARQUET}')
+""")
 
-    # =========================================================
-    # 2️⃣ Deduplicate Company
-    # =========================================================
-    con.execute(f"""
-        CREATE OR REPLACE TABLE company_dedup AS
-        SELECT *
-        FROM (
-            SELECT *,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY {COMPANY_CODE_SERVICE_COL}
-                       ORDER BY {COMPANY_UID_COL}
-                   ) rn
-            FROM {COMPANY_TABLE}
-        )
-        WHERE rn = 1;
-    """)
+con.execute(f"""
+CREATE OR REPLACE TABLE business AS
+SELECT 
+    *,
+    TRIM(UPPER(CAST({BUSINESS_CODE} AS VARCHAR))) AS business_code_clean,
+    TRIM(UPPER(CAST({BUSINESS_EIR} AS VARCHAR))) AS eir_clean,
+    TRIM(UPPER(CAST({BUSINESS_POLE} AS VARCHAR))) AS pole_clean,
+    TRIM(UPPER(CAST({BUSINESS_SOUS_POLE} AS VARCHAR))) AS sous_pole_clean,
+    TRIM(UPPER(CAST({BUSINESS_DEPARTMENT} AS VARCHAR))) AS dept_clean
+FROM read_parquet('{BUSINESS_PARQUET}')
+""")
 
-    logging.info("Deduplication complete")
+# ==========================
+# STEP 1 (PRIORITY MATCH)
+# eir + pole + department contains 'GTS'
+# ==========================
 
-    # =========================================================
-    # 3️⃣ Dynamic Business Columns
-    # =========================================================
-    business_columns = con.execute(f"""
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_name = 'business_dedup'
-    """).fetchall()
+con.execute("""
+CREATE OR REPLACE TABLE step1_match AS
+SELECT *
+FROM (
+    SELECT 
+        p.*,
+        b.*,
+        ROW_NUMBER() OVER (PARTITION BY p.uid ORDER BY b.business_code_clean) rn
+    FROM people p
+    LEFT JOIN business b
+      ON p.eir_clean = b.eir_clean
+     AND p.pole_clean = b.pole_clean
+     AND b.dept_clean LIKE '%GTS%'
+) t
+WHERE rn = 1
+""")
 
-    business_select_clause = ",\n".join([
-        f"b.{col[0]} AS {BUSINESS_PREFIX}{col[0]}"
-        for col in business_columns
-    ])
+# ==========================
+# STEP 2 (SECOND PRIORITY)
+# eir + pole + sous_pole
+# ==========================
 
-    # =========================================================
-    # 4️⃣ PRIORITY MATCHING + RANKING + CONFIDENCE
-    # =========================================================
-    con.execute(f"""
-        CREATE OR REPLACE TABLE final_output AS
-        SELECT
-            p.*,
-            {business_select_clause},
+con.execute("""
+CREATE OR REPLACE TABLE step2_match AS
+SELECT *
+FROM (
+    SELECT 
+        p.*,
+        b.*,
+        ROW_NUMBER() OVER (PARTITION BY p.uid ORDER BY b.business_code_clean) rn
+    FROM people p
+    LEFT JOIN business b
+      ON p.eir_clean = b.eir_clean
+     AND p.pole_clean = b.pole_clean
+     AND p.sous_pole_clean = b.sous_pole_clean
+    WHERE p.uid NOT IN (SELECT uid FROM step1_match)
+) t
+WHERE rn = 1
+""")
 
-            -- Match Type
-            CASE
-                WHEN LOWER(p.{PEOPLE_DEPT_COL}) LIKE '%gts%'
-                     AND p.{PEOPLE_POLE_COL} = b.{BUSINESS_POLE_COL}
-                     AND p.{PEOPLE_EIR_COL} = b.{BUSINESS_EIR_COL}
-                THEN 'STEP1_GTS_MATCH'
+# ==========================
+# STEP 3 (NORMAL BUSINESS_CODE MATCH)
+# ==========================
 
-                WHEN LOWER(p.{PEOPLE_DEPT_COL}) NOT LIKE '%gts%'
-                     AND p.{PEOPLE_POLE_COL} = b.{BUSINESS_POLE_COL}
-                     AND p.{PEOPLE_SOUS_POLE_COL} = b.{BUSINESS_SOUS_POLE_COL}
-                     AND p.{PEOPLE_EIR_COL} = b.{BUSINESS_EIR_COL}
-                THEN 'STEP2_SOUS_POLE_MATCH'
+con.execute("""
+CREATE OR REPLACE TABLE normal_match AS
+SELECT *
+FROM (
+    SELECT 
+        p.*,
+        b.*,
+        ROW_NUMBER() OVER (PARTITION BY p.uid ORDER BY b.business_code_clean) rn
+    FROM people p
+    LEFT JOIN business b
+      ON p.business_code_clean = b.business_code_clean
+    WHERE p.uid NOT IN (
+        SELECT uid FROM step1_match
+        UNION
+        SELECT uid FROM step2_match
+    )
+) t
+WHERE rn = 1
+""")
 
-                WHEN p.{PEOPLE_EIR_COL} = b.{BUSINESS_EIR_COL}
-                THEN 'STEP3_DIRECT_MATCH'
+# ==========================
+# FINAL UNION
+# ==========================
 
-                WHEN bf.{BUSINESS_EIR_COL} IS NOT NULL
-                THEN 'STEP4_COMPANY_FALLBACK'
+con.execute("""
+CREATE OR REPLACE TABLE people_referential AS
+SELECT * FROM step1_match
+UNION ALL
+SELECT * FROM step2_match
+UNION ALL
+SELECT * FROM normal_match
+""")
 
-                ELSE 'NO_MATCH'
-            END AS match_type,
+# ==========================
+# REMOVE DUPLICATE PEOPLE (SAFETY)
+# ==========================
 
-            -- Match Rank (lower is better)
-            CASE
-                WHEN LOWER(p.{PEOPLE_DEPT_COL}) LIKE '%gts%'
-                     AND p.{PEOPLE_POLE_COL} = b.{BUSINESS_POLE_COL}
-                     AND p.{PEOPLE_EIR_COL} = b.{BUSINESS_EIR_COL}
-                THEN 1
+con.execute("""
+CREATE OR REPLACE TABLE people_referential AS
+SELECT *
+FROM (
+    SELECT *,
+           ROW_NUMBER() OVER (PARTITION BY uid ORDER BY business_code_clean) rn
+    FROM people_referential
+) t
+WHERE rn = 1
+""")
 
-                WHEN LOWER(p.{PEOPLE_DEPT_COL}) NOT LIKE '%gts%'
-                     AND p.{PEOPLE_POLE_COL} = b.{BUSINESS_POLE_COL}
-                     AND p.{PEOPLE_SOUS_POLE_COL} = b.{BUSINESS_SOUS_POLE_COL}
-                     AND p.{PEOPLE_EIR_COL} = b.{BUSINESS_EIR_COL}
-                THEN 2
+# ==========================
+# EXPORT TO PARQUET
+# ==========================
 
-                WHEN p.{PEOPLE_EIR_COL} = b.{BUSINESS_EIR_COL}
-                THEN 3
+con.execute(f"""
+COPY people_referential TO '{OUTPUT_PARQUET}' (FORMAT PARQUET);
+""")
 
-                WHEN bf.{BUSINESS_EIR_COL} IS NOT NULL
-                THEN 4
+con.close()
 
-                ELSE 99
-            END AS match_rank,
-
-            -- Confidence Score
-            CASE
-                WHEN LOWER(p.{PEOPLE_DEPT_COL}) LIKE '%gts%' THEN 100
-                WHEN p.{PEOPLE_SOUS_POLE_COL} IS NOT NULL THEN 90
-                WHEN p.{PEOPLE_EIR_COL} IS NOT NULL THEN 75
-                WHEN bf.{BUSINESS_EIR_COL} IS NOT NULL THEN 60
-                ELSE 0
-            END AS confidence_score,
-
-            -- Audit Flags
-            (LOWER(p.{PEOPLE_DEPT_COL}) LIKE '%gts%') AS is_gts_department,
-            (p.{PEOPLE_POLE_COL} IS NOT NULL) AS has_pole,
-            (p.{PEOPLE_SOUS_POLE_COL} IS NOT NULL) AS has_sous_pole
-
-        FROM {PEOPLE_TABLE} p
-
-        LEFT JOIN business_dedup b
-            ON p.{PEOPLE_EIR_COL} = b.{BUSINESS_EIR_COL}
-
-        LEFT JOIN company_dedup c
-            ON p.{PEOPLE_CODE_SERVICE_COL} = c.{COMPANY_CODE_SERVICE_COL}
-
-        LEFT JOIN business_dedup bf
-            ON c.{COMPANY_UID_COL} = bf.{BUSINESS_UID_COL};
-    """)
-
-    logging.info("Priority matching completed")
-
-    # =========================================================
-    # 5️⃣ Metrics Logging
-    # =========================================================
-    total = con.execute("SELECT COUNT(*) FROM final_output").fetchone()[0]
-    unmatched = con.execute("""
-        SELECT COUNT(*) FROM final_output
-        WHERE match_type = 'NO_MATCH'
-    """).fetchone()[0]
-
-    logging.info(f"Total rows processed: {total}")
-    logging.info(f"Unmatched rows: {unmatched}")
-
-    # =========================================================
-    # 6️⃣ Export Optimized Parquet
-    # =========================================================
-    con.execute("""
-        COPY final_output
-        TO 'final_output.parquet'
-        (FORMAT PARQUET, COMPRESSION ZSTD);
-    """)
-
-    logging.info("Export completed successfully")
-
-except Exception as e:
-    logging.error(str(e))
-    raise
+print("✅ Referential Mapping Completed Successfully")
